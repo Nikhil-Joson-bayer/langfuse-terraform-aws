@@ -1,0 +1,9 @@
+# -----------------------------------------------------------------------------
+# S3 Backend Configuration for Dev Environment
+# Usage: terraform init -backend-config=backend.conf
+# -----------------------------------------------------------------------------
+bucket         = "terraform-state-<your-account-id>"
+key            = "ai-langfuse/dev/terraform.tfstate"
+region         = "eu-central-1"
+dynamodb_table = "terraform-locks"
+encrypt        = true

@@ -1,0 +1,8 @@
+framework:
+  - terraform
+quiet: true
+compact: true
+soft-fail: false
+skip-check:
+  - CKV_AWS_144 # Cross-region S3 replication (centralized single-region logging)
+  - CKV_AWS_145 # S3 KMS encryption (configured via SSE-KMS)

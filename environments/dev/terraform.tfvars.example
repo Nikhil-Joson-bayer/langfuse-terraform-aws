@@ -1,0 +1,44 @@
+# =============================================================================
+# Terraform Variables Example: Dev Environment
+# Copy to terraform.tfvars and fill in your Service Catalog VPC details
+# =============================================================================
+
+aws_region  = "eu-central-1"
+environment = "dev"
+
+# Central Observability VPC provisioned via AWS Service Catalog
+vpc_id             = "vpc-0123456789abcdef0"
+private_subnet_ids = [
+  "subnet-0123456789abcdef1",
+  "subnet-0123456789abcdef2"
+]
+
+# Principal ARNs allowed to connect to the PrivateLink Endpoint Service
+# Note: The current AWS account is automatically included dynamically. Add external spoke account ARNs here if cross-account.
+allowed_principals = []
+
+# Pinned Langfuse version
+langfuse_version = "3.22.0"
+
+# Optional: KMS CMK ARN from platform infra (leave null to generate a dedicated CMK)
+kms_key_arn = null
+
+# Sizing for Dev
+db_min_capacity = 0.5
+db_max_capacity = 4.0
+redis_node_type = "cache.t4g.micro"
+
+# ClickHouse settings:
+# If using ClickHouse Cloud or external instance:
+# clickhouse_url           = "http://clickhouse.internal:8123"
+# clickhouse_migration_url = "clickhouse://clickhouse.internal:9000"
+# clickhouse_user          = "default"
+# clickhouse_password      = "supersecretpassword"
+
+# If testing locally in ECS with embedded single-node container:
+enable_embedded_clickhouse = true
+
+tags = {
+  "Project"     = "PX-CH-Langfuse-Central"
+  "Environment" = "dev"
+}

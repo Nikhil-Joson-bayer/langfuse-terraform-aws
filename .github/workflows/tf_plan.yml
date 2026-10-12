@@ -1,0 +1,74 @@
+name: "Terraform Plan"
+
+on:
+  pull_request:
+    branches:
+      - main
+      - stage
+      - prod
+    paths:
+      - 'modules/**'
+      - 'environments/**'
+      - '.github/workflows/**'
+
+permissions:
+  id-token: write
+  contents: read
+  pull-requests: write
+
+jobs:
+  plan:
+    name: "Terraform Plan (${{ matrix.environment }})"
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        environment: [dev]
+    environment: ${{ matrix.environment }}
+
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      - name: Configure AWS Credentials (OIDC)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          aws-region: ${{ vars.AWS_REGION || 'eu-central-1' }}
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: "1.14.6"
+
+      - name: Setup backend.conf
+        working-directory: environments/${{ matrix.environment }}
+        run: |
+          if [ ! -f backend.conf ]; then
+            echo "bucket         = \"${{ vars.STATE_S3_BUCKET || secrets.STATE_S3_BUCKET }}\"" > backend.conf
+            echo "key            = \"ai-langfuse/${{ matrix.environment }}/terraform.tfstate\"" >> backend.conf
+            echo "region         = \"${{ vars.AWS_REGION || 'eu-central-1' }}\"" >> backend.conf
+            echo "dynamodb_table = \"${{ vars.STATE_DYNAMODB_TABLE || secrets.STATE_DYNAMODB_TABLE || 'terraform-locks' }}\"" >> backend.conf
+            echo "encrypt        = true" >> backend.conf
+          fi
+
+      - name: Terraform Init
+        working-directory: environments/${{ matrix.environment }}
+        run: |
+          terraform init -backend-config=backend.conf
+
+      - name: Terraform Plan
+        working-directory: environments/${{ matrix.environment }}
+        env:
+          TF_VAR_vpc_id: ${{ vars.VPC_ID || secrets.VPC_ID }}
+          TF_VAR_private_subnet_ids: ${{ vars.PRIVATE_SUBNET_IDS || secrets.PRIVATE_SUBNET_IDS }}
+          TF_VAR_allowed_principals: ${{ vars.ALLOWED_PRINCIPALS || secrets.ALLOWED_PRINCIPALS || '[]' }}
+          TF_VAR_enable_embedded_clickhouse: ${{ vars.ENABLE_EMBEDDED_CLICKHOUSE || 'true' }}
+          TF_VAR_clickhouse_password: ${{ secrets.CLICKHOUSE_PASSWORD || '' }}
+          TF_VAR_clickhouse_url: ${{ vars.CLICKHOUSE_URL || secrets.CLICKHOUSE_URL || '' }}
+          TF_VAR_clickhouse_migration_url: ${{ vars.CLICKHOUSE_MIGRATION_URL || secrets.CLICKHOUSE_MIGRATION_URL || '' }}
+          TF_VAR_kms_key_arn: ${{ vars.KMS_KEY_ARN || secrets.KMS_KEY_ARN || '' }}
+          TF_VAR_create_dns_zone: ${{ vars.CREATE_DNS_ZONE || 'false' }}
+          TF_VAR_owner: ${{ vars.OWNER || 'PX-CH-Team' }}
+          TF_VAR_platform: ${{ vars.PLATFORM || 'PX-CH-Parchai' }}
+        run: |
+          terraform plan -input=false

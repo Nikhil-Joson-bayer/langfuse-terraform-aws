@@ -41,7 +41,7 @@ jobs:
           persist-credentials: false
       - id: dirs
         run: |
-          dirs=$(for d in . examples/*/; do
+          dirs=$(for d in modules/hub modules/spoke; do
             d=${d%/}
             ls "$d"/*.tf >/dev/null 2>&1 && printf '%s\n' "$d"
           done | jq -R . | jq -sc .)

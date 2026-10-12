@@ -1,617 +1,284 @@
-<img width="2400" height="600" alt="hero-b" src="https://github.com/user-attachments/assets/8bf296d2-b41b-483f-be93-695ecd452352" />
+# Langfuse Centralized Observability on AWS (Hub & Spoke Architecture)
 
-# AWS Langfuse Terraform module
+[![Terraform](https://img.shields.io/badge/Terraform-%E2%89%A51.14.6-623CE4.svg?logo=terraform)](https://www.terraform.io/)
+[![AWS Provider](https://img.shields.io/badge/AWS%20Provider-%E2%89%A55.0%20%3C7.0-F90.svg?logo=amazon-aws)](https://registry.terraform.io/providers/hashicorp/aws/latest)
+[![Langfuse](https://img.shields.io/badge/Langfuse-v3.x-000000.svg?logo=langfuse)](https://langfuse.com/)
 
-This repository contains a Terraform module for deploying [Langfuse](https://langfuse.com/) - the open-source LLM observability platform - on AWS.
-This module aims to provide a production-ready, secure, and scalable deployment using managed services whenever possible.
+Centralized LLM observability platform for the **PX CH Parchai Platform** at Bayer. 
+Provides unified tracing, evaluations, session replays, and cost monitoring across all platform agents (**CH MAIA**, **Top Loss Card**, and future sub-teams) through **one centralized Langfuse instance** with project-level isolation and zero data leakage.
 
-## Usage
+---
 
-1. Set up the module with the settings that suit your need. A minimal installation requires a `domain` which is under your control. Configure the kubernetes and helm providers to connect to the EKS cluster.
+## 1. Architecture Overview
+
+This solution implements a **Centralized Hub-and-Spoke model powered by AWS PrivateLink**:
+- **Central Hub**: Deployed in a central observability VPC. Runs Langfuse on **AWS ECS Fargate**, backed by **Aurora Serverless v2 PostgreSQL**, **ElastiCache Redis 7.x**, an internal **Network Load Balancer (NLB)**, and an **AWS VPC Endpoint Service**.
+- **Spokes (Agent Teams)**: Any agent running in another VPC (e.g. `ch-px-ai-maia-infra` or future sub-teams) provisions a lightweight **Interface VPC Endpoint** via our `spoke` module. Traffic traverses the private AWS network backbone—no public internet exposure, no VPC peering route conflicts, and zero hub reconfiguration.
+
+```
+┌────────────────────────────────────────────────────────────┐
+│               Central Observability VPC                    │
+│                                                            │
+│  ┌─────────────────────────────────────────────────────┐  │
+│  │  ECS Fargate                                        │  │
+│  │  ├── langfuse-web    (port 3000)                    │  │
+│  │  ├── langfuse-worker (background jobs & queues)     │  │
+│  │  └── clickhouse      (embedded OLAP analytics)      │  │
+│  └───────────────────────────────────────────────────┬─┘  │
+│                      ↓                               │     │
+│  ┌───────────────────┐   ┌──────────────────┐        │     │
+│  │ Aurora Serverless │   │ ElastiCache Redis│        │     │
+│  │ v2 (PostgreSQL)   │   │ 7.x (BullMQ)     │        │     │
+│  └───────────────────┘   └──────────────────┘        │     │
+│                                                       │     │
+│  ┌────────────────────────────────────────────────┐  │     │
+│  │  Network Load Balancer (NLB)                   │  │     │
+│  │  → IP Targets: ECS tasks on TCP port 3000      │  │     │
+│  └───────────────────────────┬────────────────────┘  │     │
+│                              │                        │     │
+│  ┌───────────────────────────▼────────────────────┐  │     │
+│  │  VPC Endpoint Service (PrivateLink)            │  │     │
+│  │  com.amazonaws.vpce.eu-central-1.vpce-svc-XXXX │  │     │
+│  └───────────────────────────┬────────────────────┘  │     │
+└──────────────────────────────┼────────────────────────┘     │
+                               │  AWS PrivateLink (private)    │
+              ┌────────────────┼─────────────────┐
+              │                │                 │
+   ┌──────────▼─────┐  ┌───────▼────────┐  ┌────▼───────────┐
+   │  CH MAIA VPC   │  │ Top Loss VPC   │  │ Future Agent   │
+   │  Interface     │  │ Interface      │  │ VPC Interface  │
+   │  Endpoint      │  │ Endpoint       │  │ Endpoint       │
+   │  10.x.x.x:3000 │  │ 10.y.y.y:3000  │  │ 10.z.z.z:3000  │
+   └──────────┬─────┘  └───────┬────────┘  └────┬───────────┘
+              │                │                 │
+   ┌──────────▼─────┐  ┌───────▼────────┐  ┌────▼───────────┐
+   │ MAIA Agent     │  │ Top Loss Agent │  │ Agent C Code   │
+   │ LANGFUSE_HOST= │  │ LANGFUSE_HOST= │  │ LANGFUSE_HOST= │
+   │ langfuse.      │  │ langfuse.      │  │ langfuse.      │
+   │ internal.bayer │  │ internal.bayer │  │ internal.bayer │
+   └────────────────┘  └────────────────┘  └────────────────┘
+```
+
+### Why NLB Instead of ALB?
+AWS PrivateLink **mandates a Network Load Balancer (NLB)** as the endpoint service target. An Application Load Balancer (ALB) cannot act as an endpoint service target. This repository uses an internal NLB directly targeting ECS Fargate task IPs on port 3000.
+
+---
+
+## 2. AWS Services Created & Architectural Roles
+
+| AWS Service | Resource Identifier / Type | Architectural Role |
+|---|---|---|
+| **AWS ECS Fargate** | `aws_ecs_cluster`, `aws_ecs_task_definition`, `aws_ecs_service` | Serverless container compute running `langfuse-web` (UI/API), `langfuse-worker` (background tasks), and optional embedded `clickhouse` with container health checks and dependencies. |
+| **Amazon Aurora Serverless v2** | `aws_rds_cluster`, `aws_rds_cluster_instance`, `aws_db_subnet_group` | PostgreSQL 15.7 engine storing relational data (organizations, projects, users, API keys, prompt versions). Auto-scales between 0.5 and 4.0+ ACUs. |
+| **Amazon ElastiCache Redis** | `aws_elasticache_replication_group`, `aws_elasticache_subnet_group`, `aws_elasticache_parameter_group` | Redis 7.1 replication group with `noeviction` maxmemory policy (mandated for BullMQ background queues), transit TLS, and KMS at-rest encryption. |
+| **AWS Network Load Balancer** | `aws_lb`, `aws_lb_target_group`, `aws_lb_listener` | Internal NLB load-balancing TCP port 3000 across private subnets; targets Fargate tasks via IP mode with HTTP `/api/public/health` checks. |
+| **AWS PrivateLink** | `aws_vpc_endpoint_service`, `aws_vpc_endpoint_service_allowed_principal` | Endpoint service attached to the NLB exposing Langfuse securely to other Bayer VPCs without internet routing or VPC peering. |
+| **AWS Secrets Manager** | `aws_secretsmanager_secret`, `aws_secretsmanager_secret_version` | Stores database credentials, Redis connection URL with auth token, application secrets (NextAuth secret, encryption key, salt), and ClickHouse credentials. |
+| **AWS KMS** | `aws_kms_key`, `aws_kms_alias` | Customer Managed Key (CMK) providing unified encryption at rest for Aurora, Redis, Secrets Manager, S3, and CloudWatch Logs. |
+| **Amazon S3** | `aws_s3_bucket`, `aws_s3_bucket_lifecycle_configuration` | KMS-encrypted bucket for asynchronous batch trace uploads and export artifacts with lifecycle transition rules. |
+| **Amazon CloudWatch** | `aws_cloudwatch_log_group` | Encrypted logging for ECS container streams (`web`, `worker`, `clickhouse`) and Redis slow-log delivery. |
+| **Amazon Route 53** | `aws_route53_zone`, `aws_route53_record` | Optional Route53 Private Hosted Zone and alias records (`langfuse.internal.bayer` ➔ NLB). Automatically falls back to NLB DNS when unconfigured. |
+| **AWS IAM** | `aws_iam_role`, `aws_iam_role_policy` | Scoped least-privilege roles for ECS Task Execution (image pull, secret retrieval, KMS decrypt) and ECS Task Role (S3 read/write, ECS Exec). |
+
+---
+
+## 3. Container Environment Variables & Secrets Reference
+
+### `langfuse-web` Container
+
+| Name | Type | Value / Source | Description |
+|---|---|---|---|
+| `NODE_ENV` | Variable | `"production"` | Production runtime environment |
+| `PORT` | Variable | `"3000"` | HTTP listener port |
+| `NEXTAUTH_URL` | Variable | Resolved DNS or NLB DNS | Base URL for NextAuth authentication redirects |
+| `LANGFUSE_ENABLE_EXPERIMENTAL_FEATURES` | Variable | `"true"` | Enables feature flags in Langfuse v3 |
+| `LANGFUSE_S3_EVENT_UPLOAD_BUCKET` | Variable | S3 Bucket Name | Destination bucket for batch trace uploads |
+| `LANGFUSE_S3_EVENT_UPLOAD_REGION` | Variable | AWS Region | Region of the S3 events bucket |
+| `TELEMETRY_ENABLED` | Variable | `"false"` | Disables external telemetry to public endpoints |
+| `CLICKHOUSE_URL` | Variable | HTTP URL (e.g. `http://127.0.0.1:8123`) | ClickHouse HTTP endpoint for OLAP trace queries |
+| `CLICKHOUSE_MIGRATION_URL` | Variable | TCP URL (e.g. `clickhouse://127.0.0.1:9000`) | ClickHouse native TCP migration URL |
+| `CLICKHOUSE_USER` | Variable | `"default"` | ClickHouse database username |
+| `CLICKHOUSE_DB` | Variable | `"default"` | ClickHouse database name |
+| `CLICKHOUSE_CLUSTER_ENABLED` | Variable | `"false"` | Single-node / standalone ClickHouse mode |
+| `DATABASE_URL` | **Secret** | Secrets Manager `db-credentials:database_url` | PostgreSQL connection string |
+| `REDIS_URL` | **Secret** | Secrets Manager `redis-credentials:redis_url` | TLS Redis connection string with auth token |
+| `NEXTAUTH_SECRET` | **Secret** | Secrets Manager `app-secrets:nextauth_secret` | 32-byte secret used to sign NextAuth JWTs |
+| `SALT` | **Secret** | Secrets Manager `app-secrets:salt` | Salt for password hashing |
+| `ENCRYPTION_KEY` | **Secret** | Secrets Manager `app-secrets:langfuse_encryption_key` | 256-bit hex encryption key |
+| `LANGFUSE_ENCRYPTION_KEY` | **Secret** | Secrets Manager `app-secrets:langfuse_encryption_key` | Duplicate alias for encryption key parity |
+| `CLICKHOUSE_PASSWORD` | **Secret** | Secrets Manager `clickhouse-credentials:password` | ClickHouse password (if configured) |
+| `AUTH_AZURE_AD_*` | **Secret** | Secrets Manager `entra-credentials:*` | Optional Microsoft Entra ID SSO credentials |
+
+### `langfuse-worker` Container
+Runs the async BullMQ worker using the identical environment variables and secrets as `langfuse-web`. Configured with `dependsOn = [clickhouse: HEALTHY]` when embedded ClickHouse is active.
+
+### `clickhouse` Container (Optional Embedded)
+- **Image**: `clickhouse/clickhouse-server:24.3`
+- **Environment**: `CLICKHOUSE_DB=default`, `CLICKHOUSE_USER=default`
+- **Health Check**: `wget --no-verbose --tries=1 --spider http://127.0.0.1:8123/ping || exit 1`
+- **Ports**: `8123` (HTTP) and `9000` (Native TCP) bound to localhost loopback.
+
+---
+
+## 4. Spoke Onboarding Guide (For Agent Teams)
+
+When onboarding a new agent (e.g. `CH MAIA`, `Top Loss`, or future agents), the agent team adds the `spoke` module to **their existing Terraform repository**.
+
+### Step 1: Add Spoke Terraform Configuration
+In the agent's Terraform codebase (e.g. `ch-px-ai-maia-infra`):
 
 ```hcl
-module "langfuse" {
-  source = "github.com/langfuse/langfuse-terraform-aws?ref=1.2.4"
+module "langfuse_spoke" {
+  source = "git::https://github.com/bayer-int/terraform-aws-langfuse-central.git//modules/spoke?ref=v1.0.0"
 
-  domain = "langfuse.example.com"
+  vpc_id                   = var.vpc_id
+  private_subnet_ids       = var.private_subnet_ids
+  endpoint_service_name    = "com.amazonaws.vpce.eu-central-1.vpce-svc-0123456789abcdef0"
+  agent_security_group_ids = [aws_security_group.agent_task.id]
 
-  # Optional use a different name for your installation
-  # e.g. when using the module multiple times on the same AWS account
-  name   = "langfuse"
+  # Optional: friendly DNS in your VPC
+  dns_zone_id              = aws_route53_zone.agent_internal.zone_id
+  dns_record_name          = "langfuse"
 
-  # Optional: Configure Langfuse
-  # use_encryption_key = false # Disable encryption (default is true for security)
-
-  # Optional: Configure the VPC
-  vpc_cidr = "10.0.0.0/16"
-  use_single_nat_gateway = false  # Using a single NAT gateway decreases costs, but is less resilient
-
-  # Optional: Configure the Kubernetes cluster
-  kubernetes_version = "1.36"
-  fargate_profile_namespaces = ["kube-system", "langfuse", "default", "cert-manager", "clickhouse-operator-system"]
-
-  # Optional: Configure the database instances
-  postgres_instance_count = 2
-  postgres_min_capacity = 0.5
-  postgres_max_capacity = 2.0
-
-  # Optional: Configure the cache
-  cache_node_type = "cache.t4g.small"
-  cache_instance_count = 2
-
-  # Optional: Configure Langfuse Helm chart version
-  langfuse_helm_chart_version = "2.1.3"
-
-  # Optional: Pin the Langfuse application version. Defaults to the latest
-  # release at the time this module version was published.
-  app_version = "4.50.0"
-  
-  # Optional: Activate additional log tables in ClickHouse. Will increase EFS costs, but may aid in debugging.
-  enable_clickhouse_log_tables = false  # Set to true to have additional logs.
-
-  # Optional: EFS throughput mode for ClickHouse storage. Elastic (default) bills per GB
-  # read and written; provisioned is usually cheaper for a steady write load.
-  efs_throughput_mode                 = "provisioned"
-  efs_provisioned_throughput_in_mibps = 20
-
-  # Optional: Enable tenant- and network-isolated code evaluator execution.
-  enable_code_based_eval_executors = true
-
-  # Optional: Langfuse AI features (in-app agent, Ask AI). Requires >= 4.25.
-  enable_ai_features      = true
-  ai_features_provider    = "bedrock"
-  ai_features_model       = "eu.anthropic.claude-opus-5"
-  ai_features_small_model = "eu.anthropic.claude-haiku-4-5-20251001-v1:0"
-  enable_in_app_agent     = true
-
-  # Optional: Add additional environment variables
-  additional_env = [
-    # Direct value
-    {
-      name  = "CUSTOM_ENV_VAR"
-      value = "custom-value"
-    },
-    # Reference to Kubernetes secret
-    {
-      name = "DATABASE_PASSWORD"
-      valueFrom = {
-        secretKeyRef = {
-          name = "my-database-secret"
-          key  = "password"
-        }
-      }
-    }
-  ]
-}
-
-provider "kubernetes" {
-  host                   = module.langfuse.cluster_host
-  cluster_ca_certificate = module.langfuse.cluster_ca_certificate
-  token                  = module.langfuse.cluster_token
-
-  exec {
-    api_version = "client.authentication.k8s.io/v1beta1"
-    command     = "aws"
-    args        = ["eks", "get-token", "--cluster-name", module.langfuse.cluster_name]
+  tags = {
+    Platform = "PX-CH-Parchai"
+    Agent    = "CH-MAIA"
   }
 }
 
-provider "helm" {
-  kubernetes {
-    host                   = module.langfuse.cluster_host
-    cluster_ca_certificate = module.langfuse.cluster_ca_certificate
-    token                  = module.langfuse.cluster_token
-
-    exec {
-      api_version = "client.authentication.k8s.io/v1beta1"
-      command     = "aws"
-      args        = ["eks", "get-token", "--cluster-name", module.langfuse.cluster_name]
-    }
-  }
+output "langfuse_endpoint_dns" {
+  description = "DNS endpoint for Langfuse SDK / OTEL exporter"
+  value       = module.langfuse_spoke.endpoint_dns
 }
 ```
 
-You can also navigate into the `examples/quickstart` directory and run the example there.
+---
 
-2. Apply the DNS zone
+### Step 2: Agent Telemetry Integration
+
+#### Path A: Zero-Code AWS AgentCore OTEL Integration (Recommended)
+AgentCore emits OpenTelemetry traces. Langfuse v3 supports OTLP ingestion natively at `/api/public/otel`.
+Set these environment variables in your AgentCore container configuration (`agents_config.yml` or Terraform):
 
 ```bash
-terraform init
-terraform apply --target module.langfuse.aws_route53_zone.zone
+# Point to your VPC Endpoint DNS on port 3000
+OTEL_EXPORTER_OTLP_ENDPOINT=http://<spoke-endpoint-dns>:3000/api/public/otel
+
+# Authorization header: Basic base64(LANGFUSE_PUBLIC_KEY:LANGFUSE_SECRET_KEY)
+OTEL_EXPORTER_OTLP_HEADERS=Authorization=Basic <base64-credentials>
 ```
 
-3. Set up the Nameserver delegation on your DNS provider, e.g.
+#### Path B: LangChain / LangGraph CallbackHandler (Python)
+For deep LLM-level observability (exact prompts, tool parameters, token usage, latency breakdowns):
 
-```bash
-$ dig NS langfuse.example.com
-ns-1.awsdns-00.org.
-ns-2.awsdns-01.net.
-ns-3.awsdns-02.com.
-ns-4.awsdns-03.co.uk.
+```python
+import os
+from langfuse.callback import CallbackHandler
+
+langfuse_handler = CallbackHandler(
+    public_key=os.environ["LANGFUSE_PUBLIC_KEY"],     # From AWS Secrets Manager
+    secret_key=os.environ["LANGFUSE_SECRET_KEY"],     # From AWS Secrets Manager
+    host=os.environ["LANGFUSE_HOST"],                 # e.g. "http://langfuse.internal.bayer:3000"
+    session_id=session_id,
+    user_id=user_email,
+)
+
+# Pass to your graph / chain execution:
+response = graph.invoke(input_payload, config={"callbacks": [langfuse_handler]})
 ```
 
-4. Apply the full stack. If this fails, run through the commands under Known Issues, and then re-run the apply command.
+---
+
+## 5. Hub Deployment Guide
+
+### AWS Environment Prerequisites
+
+1. **Central Observability VPC Subnets (AZ Spread)**:
+   - Aurora Serverless v2 PostgreSQL DB Subnet Groups and the Network Load Balancer strictly require `private_subnet_ids` to contain subnets in at least **TWO distinct Availability Zones** (e.g. `eu-central-1a` and `eu-central-1b`).
+2. **Outbound Internet Access (NAT Gateway)**:
+   - ECS Fargate tasks run in private subnets with `assign_public_ip = false`. The container images (`langfuse/langfuse:3.22.0`, `langfuse/langfuse-worker:3.22.0`, `clickhouse/clickhouse-server:24.3`) are hosted on public Docker Hub. The private subnets **MUST have an outbound route (0.0.0.0/0) through an AWS NAT Gateway** (or egress proxy) to pull images during deployment.
+3. **KMS CMK**:
+   - Provide an existing platform KMS CMK ARN via `KMS_KEY_ARN` or leave null to let Terraform provision a dedicated CMK.
+4. **Terraform S3 State Backend**:
+   - Ensure the S3 state bucket and DynamoDB lock table exist in your target AWS account.
+
+---
+
+### What to Configure in GitHub Settings (For CI/CD & Forked Repos)
+
+When deploying via GitHub Actions, **you do not need a committed `terraform.tfvars` file**. Configure the following in your repository:
+
+Navigate to: **Settings** ➔ **Secrets and variables** ➔ **Actions**
+
+#### 1. Repository Variables (under the "Variables" tab)
+
+| Variable Name | Required? | Default / Example | Description |
+|---|---|---|---|
+| `VPC_ID` | **Yes** | `vpc-0123456789abcdef0` | Central Observability VPC ID (Service Catalog) |
+| `PRIVATE_SUBNET_IDS` | **Yes** | `["subnet-aaa", "subnet-bbb"]` | Subnets in JSON array format (minimum 2 AZs) |
+| `AWS_REGION` | Optional | `eu-central-1` | AWS deployment region |
+| `STATE_S3_BUCKET` | **Yes** | `terraform-state-<your-account-id>` | S3 bucket for Terraform remote state |
+| `STATE_DYNAMODB_TABLE` | Optional | `terraform-locks` | DynamoDB table for Terraform state locking |
+| `ALLOWED_PRINCIPALS` | Optional | `[]` | Extra IAM principal ARNs for PrivateLink (current account is always auto-included) |
+| `ENABLE_EMBEDDED_CLICKHOUSE` | Optional | `"true"` | Enables embedded single-node ClickHouse on ECS |
+| `CLICKHOUSE_URL` | Optional | `""` | External ClickHouse HTTP URL (if not embedded) |
+| `CLICKHOUSE_MIGRATION_URL` | Optional | `""` | External ClickHouse TCP URL (if not embedded) |
+| `KMS_KEY_ARN` | Optional | `""` | Existing platform KMS CMK ARN (if available) |
+| `CREATE_DNS_ZONE` | Optional | `"false"` | Whether to create a Route53 private hosted zone |
+| `OWNER` | Optional | `PX-CH-Team` | Custom Owner team tag for all resources |
+| `PLATFORM` | Optional | `PX-CH-Parchai` | Custom Platform tag for all resources |
+
+> **Format Tip**: `PRIVATE_SUBNET_IDS` must be formatted as a valid JSON array string: `["subnet-0123...", "subnet-0456..."]`.
+> 
+> **Why No AWS Account ID Variable?** Terraform dynamically discovers the deploying AWS Account ID at runtime via `data.aws_caller_identity.current.account_id`. The account is automatically bound to S3 buckets, KMS policies, and PrivateLink allowed principals without any manual account ID input. The only place your Account ID is ever used is inside the `AWS_ROLE_ARN` secret and state bucket name.
+
+#### 2. Repository Secrets (under the "Secrets" tab)
+
+| Secret Name | Required? | Example Value | Description |
+|---|---|---|---|
+| `AWS_ROLE_ARN` | **Yes** | `arn:aws:iam::<your-account-id>:role/github-actions-terraform` | IAM Role for GitHub Actions OIDC authentication |
+| `CLICKHOUSE_PASSWORD` | Optional | `your-secure-password` | Password for external ClickHouse (if not embedded) |
+
+---
+
+### Local / CLI Deployment (Alternative)
+
+If testing or applying locally from your workstation:
 
 ```bash
+cd environments/dev
+
+# 1. Configure remote state backend
+cp backend.conf.example backend.conf
+# Edit backend.conf with your S3 bucket and DynamoDB table
+
+# 2. Configure variables
+cp terraform.tfvars.example terraform.tfvars
+# Fill in your vpc_id and private_subnet_ids
+
+# 3. Initialize & Deploy
+terraform init -backend-config=backend.conf
+terraform plan
 terraform apply
 ```
 
-### Known issues
+---
 
-Two race conditions can leave pods stuck in `Pending` on the initial system creation:
+## 6. Trust Boundary & Forking Policy
 
-1. **CoreDNS**: due to a race between the Fargate Profile creation and Kubernetes pod scheduling, the CoreDNS pods may need to be restarted.
-2. **ClickHouse and Keeper**: the Fargate scheduler evaluates a pod's volumes at admission time. On the first install, the PVCs created by the ClickHouse operator may not yet be bound to the pre-created EFS volumes when the scheduler first looks, and the pods are rejected with an event like:
+This hub instance is dedicated to the **PX CH Parchai Platform** agents sharing the same trust domain:
+- **Same Hub**: CH MAIA, Top Loss Card, and other PX CH team agents.
+- **Separate Teams / Organizations (Forking Instructions)**:
+  External Bayer teams requiring independent data governance should **fork this repository**:
+  1. Fork `bayer-int/terraform-aws-langfuse-central` to your team's GitHub organization.
+  2. In your forked repository's **Settings ➔ Secrets and variables ➔ Actions**, configure your own `VPC_ID`, `PRIVATE_SUBNET_IDS`, and `AWS_ROLE_ARN` as documented in Section 5.
+  3. Pushing to `main` will automatically deploy your team's independent hub with physical database and cache isolation.
 
-   ```
-   Warning  FailedScheduling  fargate-scheduler  Pod not supported on Fargate: volumes not supported:
-   clickhouse-storage-volume not supported because: PVC clickhouse-storage-volume-langfuse-clickhouse-0-0-0 not bound
-   ```
+---
 
-   The PVCs bind on their own moments later (`kubectl --namespace langfuse get pvc` shows them as `Bound`), but the Fargate scheduler does not reliably re-evaluate rejected pods. Deleting the pending pods makes the StatefulSet recreate them, and the fresh scheduling attempt succeeds.
+## 7. Preservation of Legacy EKS Manifests
 
-```bash
-# Connect your kubectl to the EKS cluster
-aws eks update-kubeconfig --name langfuse
+The upstream repository manifests based on Kubernetes (EKS, Helm, Altinity ClickHouse Operator, and AWS Load Balancer Controller) have been preserved in:
+`archive/legacy-eks-upstream/`
 
-# Restart the CoreDNS and ClickHouse containers
-kubectl --namespace kube-system rollout restart deploy coredns
-kubectl --namespace langfuse delete pod langfuse-clickhouse-0-{0,1,2}-0 langfuse-keeper-{0,1,2}-0
-```
-
-Both issues only occur on the first install, not in steady state. Afterward, your installation should become fully available.
-Navigate to your domain, e.g. langfuse.example.com, to access the Langfuse UI.
-
-### Using an Existing VPC
-
-If you already have a VPC and want to deploy Langfuse into it, you can provide the VPC ID and subnet IDs instead of having the module create a new VPC:
-
-```hcl
-module "langfuse" {
-  source = "github.com/langfuse/langfuse-terraform-aws?ref=1.2.4"
-
-  domain = "langfuse.example.com"
-
-  # Use existing VPC
-  vpc_id             = "vpc-12345678"
-  private_subnet_ids = ["subnet-aaa11111", "subnet-bbb22222", "subnet-ccc33333"]
-  public_subnet_ids  = ["subnet-xxx11111", "subnet-yyy22222", "subnet-zzz33333"]
-
-  # Optional: Provide route table IDs for S3 VPC Gateway endpoint
-  # If not provided, S3 endpoint will not be created
-  private_route_table_ids = ["rtb-11111111", "rtb-22222222"]
-}
-
-provider "kubernetes" {
-  host                   = module.langfuse.cluster_host
-  cluster_ca_certificate = module.langfuse.cluster_ca_certificate
-  token                  = module.langfuse.cluster_token
-
-  exec {
-    api_version = "client.authentication.k8s.io/v1beta1"
-    command     = "aws"
-    args        = ["eks", "get-token", "--cluster-name", module.langfuse.cluster_name]
-  }
-}
-
-provider "helm" {
-  kubernetes {
-    host                   = module.langfuse.cluster_host
-    cluster_ca_certificate = module.langfuse.cluster_ca_certificate
-    token                  = module.langfuse.cluster_token
-
-    exec {
-      api_version = "client.authentication.k8s.io/v1beta1"
-      command     = "aws"
-      args        = ["eks", "get-token", "--cluster-name", module.langfuse.cluster_name]
-    }
-  }
-}
-```
-
-**Important Notes:**
-- The module will automatically tag your subnets with the required Kubernetes tags for the AWS Load Balancer Controller:
-  - Private subnets: `kubernetes.io/role/internal-elb=1` and `kubernetes.io/cluster/<name>=shared`
-  - Public subnets: `kubernetes.io/role/elb=1` and `kubernetes.io/cluster/<name>=shared`
-- Private subnet IDs and public subnet IDs are required when using an existing VPC
-- Private route table IDs are optional - provide them if you want the module to create an S3 VPC Gateway endpoint
-- Your existing VPC must have DNS hostnames and DNS support enabled
-- Subnets should be spread across multiple availability zones for high availability
-
-## Architecture
-
-![lanfuse-v3-on-aws](./images/langfuse-v3-on-aws.svg)
-
-> :information_source: For more information on Langfuse's architecture, please check [the official documentation](https://langfuse.com/self-hosting#architecture)
-
-## Resource Configuration
-
-This module provides configurable resource allocation for all container workloads to ensure optimal performance in production environments. On AWS EKS Fargate, resource requests and limits are set to the same value for each container.
-The default values are based on the recommendations from the [Langfuse K8s documentation](https://github.com/langfuse/langfuse-k8s) and [Bitnami ClickHouse chart documentation](https://github.com/bitnami/charts/tree/main/bitnami/clickhouse).
-
-### Default Resource Allocations
-
-- **Langfuse containers** (web and worker): 2 CPU, 4 GiB memory
-- **ClickHouse containers**: 2 CPU, 8 GiB memory
-- **ClickHouse Keeper containers**: 1 CPU, 2 GiB memory
-
-These defaults provide a good starting point for production workloads, but you can adjust them based on your specific requirements by setting the corresponding variables in your Terraform configuration.
-
-### Code-Based Evals
-
-Set `enable_code_based_eval_executors = true` to enable Python and TypeScript code evaluators. The module creates tenant-isolated Lambda functions, an isolated VPC with DNS resolution disabled and no internet route or security-group egress, versioned S3 deployment packages, CloudWatch logs, and the least-privilege IAM permissions required for Langfuse to invoke the functions. It also configures the Langfuse web and worker deployments to dispatch and process code eval jobs.
-
-The Lambda handlers are copied from the canonical [Langfuse code eval runners](https://github.com/langfuse/langfuse/tree/main/scripts/code-eval-runners). They run in an isolated VPC, separate from the Langfuse VPC, so evaluator code cannot access Langfuse databases, caches, pods, or the public internet. That VPC is shared with the [Langfuse Assistant](https://langfuse.com/self-hosting/configuration/langfuse-assistant) agent sandbox — the other workload that runs untrusted code — and each workload gets its own deny-all security group. Size it with `isolated_execution_vpc_cidr`.
-
-Upgrading from 1.1.1, where this VPC existed for code evaluators alone: the module carries a
-`moved` block, so the VPC, its subnets, route tables, security group and the code evaluator
-Lambdas migrate in place rather than being recreated, and the old `code_based_eval_vpc_cidr`
-keeps working. Switch to `isolated_execution_vpc_cidr` when convenient.
-
-Two resources are replaced: the VPC flow log and its CloudWatch log group. A log group's name
-is its identity and AWS has no rename, so taking the new name means a new group, and up to 14
-days of flow-log records for this VPC are lost. Nothing else is destroyed and there is no
-downtime, since the VPC carries no traffic by design and the evaluator Lambdas are untouched.
-Verified against a real 1.1.1 deployment in a scratch account, measured at `d1f37cf`: `2 to
-add, 14 to change, 2 to destroy`, where the 14 changes are tag-only and the 2 destroys are the pair above. The VPC,
-subnets, route tables, security group, both Lambdas and the S3 bucket came out with identical
-IDs, and the VPC still had no default route, no internet gateway, no NAT and an empty
-security group afterwards.
-
-To keep the old log group and its records, drop it from state **before** upgrading. Terraform
-then leaves it alone in AWS and creates the new group alongside it:
-
-```bash
-terraform state rm 'module.langfuse.module.code_based_eval_executor_vpc[0].aws_cloudwatch_log_group.flow_log[0]'
-```
-
-Adjust the `module.langfuse` prefix to your own module label. The upgrade then plans `1 to add,
-0 to destroy` for the flow-log pair, and the old group stays until its retention expires. It is
-no longer managed by Terraform, so remove it yourself when you no longer need it.
-
-AWS Lambda tenant isolation is available in commercial AWS regions except Asia Pacific (New Zealand). It is not available in AWS GovCloud or China regions. When code-based evals are enabled, `name` must be at most 32 characters to fit Lambda and IAM naming limits.
-
-### AI features [#ai-features]
-
-Langfuse's AI features — the in-app agent and Ask AI in the filter search bar — need one
-instance-wide Langfuse AI model. Requires Langfuse `>= 4.25` and Helm chart `>= 2.1.0`, and is
-off by default. See the
-[AI features](https://langfuse.com/security/ai-features) and
-[self-hosting](https://langfuse.com/self-hosting/configuration/langfuse-assistant) docs.
-
-```hcl
-module "langfuse" {
-  # ...
-  app_version = "4.50.0" # or newer
-
-  enable_ai_features   = true
-  ai_features_provider = "bedrock"
-  ai_features_model    = "eu.anthropic.claude-opus-5"
-  enable_in_app_agent  = true
-
-  # Optional: a cheaper model for supplementary calls such as conversation titles
-  ai_features_small_model = "eu.anthropic.claude-haiku-4-5-20251001-v1:0"
-
-  # Optional: isolated file and code execution for the agent
-  enable_agent_sandbox_microvm = true
-}
-```
-
-Setting `enable_ai_features` with `ai_features_provider` and `ai_features_model` renders `LANGFUSE_AI_*` on web and
-worker; both call the model, web for Ask AI and conversation titles and worker for agent runs.
-Also set `ai_features_small_model` to a cheaper model: supplementary calls such as
-conversation titles fall back to `ai_features_model` when it is unset, which means paying
-the primary model's price for them. Langfuse Cloud pairs Claude Opus 5 with Claude Haiku 4.5.
-For `bedrock` the module also grants `bedrock:InvokeModel` and
-`bedrock:InvokeModelWithResponseStream` on the Langfuse IAM role — invoke-only, and on every
-model by default, which is cost exposure rather than privilege. Narrow it with
-`ai_features_bedrock_model_arns`.
-
-Activate the model in the account before enabling the AI features. Invoke permission alone is
-not enough: a third-party model needs a Marketplace agreement, and Anthropic models also need
-a one-time use-case form. The module does not manage this, because the form carries your own
-company and use-case details, the agreement is account-wide rather than per deployment, and
-`ai_features_model` takes an inference profile that can span several foundation model IDs. Do
-it in the Bedrock console, or in your own root module:
-
-```hcl
-data "aws_bedrock_foundation_model_agreement_offers" "claude" {
-  model_id = "anthropic.claude-opus-5"
-}
-
-resource "aws_bedrock_use_case_for_model_access" "anthropic" {
-  form_data = base64encode(file("bedrock-use-case.json")) # your company and use case
-}
-
-resource "aws_bedrock_foundation_model_agreement" "claude" {
-  model_id    = "anthropic.claude-opus-5"
-  offer_token = data.aws_bedrock_foundation_model_agreement_offers.claude.offers[0].offer_token
-  depends_on  = [aws_bedrock_use_case_for_model_access.anthropic]
-}
-```
-
-Either way, confirm the model answers in the Bedrock playground before enabling the AI
-features.
-
-The module renders these as `langfuse.aiFeatures.*` Helm values rather than assembling
-`additionalEnv` itself, so the chart owns placement — model on web and worker, sandbox on the
-worker only — and validates the combinations. Chart `2.1.0` is where those values were added;
-apply fails with a clear message if `langfuse_helm_chart_version` is older, because Helm
-ignores unknown values silently and the features would otherwise be quietly absent.
-
-`anthropic` and `openai` need no AWS resources, only a key: set `ai_features_api_key` and,
-if you use a gateway or a non-default endpoint, `ai_features_base_url` (include `/v1` for
-`openai`). The key is stored in the `langfuse` Kubernetes secret and referenced by
-`secretKeyRef`, so it never reaches the Helm values. Bedrock ignores both — it authenticates
-through the AWS credential chain. `LANGFUSE_AI_EXTRA_HEADERS` and
-`LANGFUSE_AI_USE_RESPONSES_API` are not exposed as variables; set them via `additional_env`.
-
-This module writes the AI feature variables itself, so do not also set the Helm chart's own
-AI feature values. Both would render into the same containers, leaving two entries per
-variable; the module's value wins, but only because `additionalEnv` is rendered last.
-
-#### Agent sandbox (Lambda MicroVM)
-
-`enable_agent_sandbox_microvm = true` backs the agent's file and code execution tools with an
-AWS Lambda MicroVM. The module creates an S3 bucket for the image artifact, a build role that
-Lambda assumes during `CreateMicrovmImage`, an unprivileged execution role the guest runs as,
-a deny-all security group and VPC egress network connector in the shared
-[isolated VPC](#code-based-evals), the `RunMicrovm` permissions on the Langfuse IAM role, and
-the `LANGFUSE_IN_APP_AGENT_SANDBOX_*` variables on the worker.
-
-Without the egress connector AWS attaches its default `INTERNET_EGRESS` connector and
-sandboxed code reaches the public internet, so the connector is not optional. Lambda MicroVMs
-are available only in commercial AWS regions, not GovCloud or China, and the region must offer
-them; apply fails otherwise.
-
-The module does **not** build the MicroVM image — that needs a Langfuse checkout, Docker and
-pnpm. After apply, from a [Langfuse](https://github.com/langfuse/langfuse) checkout at the
-same version you deploy:
-
-```bash
-export AWS_PROFILE=<profile>
-terraform output -json agent_sandbox_build_env \
-  | jq -r 'to_entries[] | "export \(.key)=\(.value)"' > .env && source .env
-
-bash packages/in-app-agent-sandbox-runtime/build-microvm-image.sh
-```
-
-The identity running the script needs `s3:PutObject` on the artifact bucket,
-`lambda:CreateMicrovmImage` / `ListMicrovmImages` / `GetMicrovmImage` / `UpdateMicrovmImage`,
-and `iam:PassRole` on the build role. Without that `iam:PassRole`, `CreateMicrovmImage`
-returns `AccessDeniedException`.
-
-Rebuild the image whenever you upgrade Langfuse, and build it from the same release you
-deploy. Treat the image as part of the deployment rather than one-time setup: the worker does
-not currently verify that the guest runtime matches its own version, so an image left behind
-by an upgrade surfaces as file or bash tools misbehaving rather than as a clear error.
-
-### Customizing Resources
-
-You can override any of the resource configurations by setting the appropriate variables.
-For example, to increase ClickHouse Keeper resources:
-
-```hcl
-module "langfuse" {
-  source = "github.com/langfuse/langfuse-terraform-aws?ref=1.2.4"
-
-  domain = "langfuse.example.com"
-
-  # Increase ClickHouse Keeper resources
-  clickhouse_keeper_cpu    = "2"
-  clickhouse_keeper_memory = "4Gi"
-}
-```
-
-## Features
-
-This module creates a complete Langfuse stack with the following components:
-
-- VPC with public and private subnets (or use an existing VPC)
-- EKS cluster with Fargate compute
-- Aurora PostgreSQL Serverless v2 cluster
-- ElastiCache Redis cluster
-- S3 bucket for storage
-- ClickHouse cluster managed by the official [ClickHouse Kubernetes operator](https://github.com/ClickHouse/clickhouse-operator) (including ClickHouse Keeper and cert-manager), or optionally an external ClickHouse such as ClickHouse Cloud
-- TLS certificates and Route53 DNS configuration
-- Required IAM roles and security groups
-- Optional tenant-isolated AWS Lambda executors for code-based evals
-- Optional AWS Lambda MicroVM sandbox for the in-app agent's code execution tools
-- AWS Load Balancer Controller for ingress
-- EFS CSI Driver for persistent storage
-
-## Langfuse version
-
-The module deploys the Langfuse Helm chart v2 (`langfuse_helm_chart_version`), which ships [Langfuse v4](https://langfuse.com/docs/v4). The Langfuse application version is pinned explicitly through the `app_version` variable, which defaults to the latest Langfuse release at the time the module version was published. To upgrade Langfuse, set `app_version` to a newer [release](https://github.com/langfuse/langfuse/releases):
-
-```hcl
-module "langfuse" {
-  # ...
-  app_version = "4.50.0"
-}
-```
-
-## ClickHouse
-
-By default the Langfuse Helm chart v2 deploys a ClickHouse cluster into the EKS cluster through the official [ClickHouse Kubernetes operator](https://github.com/ClickHouse/clickhouse-operator) (`ClickHouseCluster` and `KeeperCluster` resources), backed by EFS persistent volumes. To support this, the module installs:
-
-- [cert-manager](https://cert-manager.io/) (required by the operator to issue its admission webhook certificates)
-- The ClickHouse operator (`oci://ghcr.io/clickhouse/clickhouse-operator-helm`)
-
-The deployment can be sized with the `clickhouse_replicas`, `clickhouse_cpu`, `clickhouse_memory`, `clickhouse_keeper_replicas`, `clickhouse_keeper_cpu`, and `clickhouse_keeper_memory` variables.
-
-### External ClickHouse (bring your own)
-
-To use an existing ClickHouse instead — for example [ClickHouse Cloud](https://clickhouse.com/cloud) — set `external_clickhouse`. The module then skips cert-manager, the operator, the in-cluster ClickHouse, and the entire EFS file system (which only exists for ClickHouse storage). See [examples/external-clickhouse](examples/external-clickhouse/external-clickhouse.tf) for a full example.
-
-Langfuse requires both PostgreSQL and ClickHouse to use UTC. If you customize either data store or connect an external ClickHouse instance, verify its timezone before deployment. See the [timezone requirements and verification steps](https://langfuse.com/faq/all/self-hosting-timezone-errors).
-
-```hcl
-module "langfuse" {
-  source = "github.com/langfuse/langfuse-terraform-aws"
-
-  domain = "langfuse.example.com"
-
-  external_clickhouse = {
-    host = "https://abc123.us-east-1.aws.clickhouse.cloud"
-    # Defaults: http_port = 8443, native_port = 9440, username = "default",
-    # database = "default", cluster_enabled = true, migration_ssl = true
-  }
-  external_clickhouse_password = var.clickhouse_password
-}
-```
-
-Set `cluster_enabled = false` for ClickHouse Cloud on Azure or for single-node deployments. Make sure the EKS cluster can reach the external ClickHouse (for ClickHouse Cloud, check the IP allowlist or use AWS PrivateLink).
-
-### Migrating from module versions <= 0.6.x
-
-Earlier versions of this module deployed Langfuse v3 with the Bitnami-based Helm chart v1, which ran ClickHouse (and ZooKeeper) as a Bitnami subchart. **Upgrading is a breaking change**: the operator-managed ClickHouse starts empty (new EFS access points and persistent volumes), and the Helm chart refuses a raw in-place `helm upgrade` that would replace leftover Bitnami volumes. Existing installations must migrate in two steps:
-
-1. Migrate the chart deployment (copying the ClickHouse data) following the [chart v1 → v2 migration guide](https://github.com/langfuse/langfuse-k8s/tree/main/examples/upgrade-v1-to-v2).
-2. Upgrade the application following the [Langfuse v3 → v4 upgrade guide](https://langfuse.com/self-hosting/upgrade/upgrade-guides/upgrade-v3-to-v4).
-
-The `clickhouse_instance_count` variable was removed: the number of EFS access points and persistent volumes now follows `clickhouse_replicas` and the new `clickhouse_keeper_replicas` variable. New installations are unaffected. If you need to stay on the Bitnami-based deployment for now, pin this module to `0.6.x`.
-
-## Teardown
-
-To remove all resources created by this module, run `terraform destroy` and confirm the plan.
-
-Expect the destroy to take 30-45 minutes: EKS deletes Fargate profiles one at a time (several minutes each), and Aurora, ElastiCache, EFS, and the VPC each add multi-minute deletions on top.
-A destroy that appears stuck is usually just working through these — do **not** delete resources manually (e.g. `aws eks delete-cluster`) while it runs; that breaks the remaining teardown.
-
-## Requirements
-
-| Name       | Version   |
-|------------|-----------|
-| terraform  | >= 1.9    |
-| aws        | >= 6.61, < 7.0 |
-| archive    | ~> 2.8    |
-| kubernetes | ~> 2.0    |
-| helm       | ~> 2.7    |
-
-## Providers
-
-| Name       | Version   |
-|------------|-----------|
-| aws        | >= 6.61, < 7.0 |
-| archive    | ~> 2.8    |
-| kubernetes | ~> 2.0    |
-| helm       | ~> 2.7    |
-| random     | ~> 3.0    |
-| tls        | ~> 4.0    |
-
-## Resources
-
-| Name                                    | Type     |
-|-----------------------------------------|----------|
-| aws_eks_cluster.langfuse                | resource |
-| aws_eks_fargate_profile.namespaces      | resource |
-| aws_rds_cluster.postgres                | resource |
-| aws_elasticache_replication_group.redis | resource |
-| aws_s3_bucket.langfuse                  | resource |
-| aws_acm_certificate.cert                | resource |
-| aws_route53_zone.zone                   | resource |
-| aws_iam_role.eks                        | resource |
-| aws_iam_role.fargate                    | resource |
-| aws_lambda_function.code_based_eval_executor | resource |
-| aws_lambdacore_network_connector.agent_sandbox_egress | resource |
-| aws_security_group.eks                  | resource |
-| aws_security_group.postgres             | resource |
-| aws_security_group.redis                | resource |
-| aws_security_group.vpc_endpoints        | resource |
-
-## Inputs
-
-| Name                              | Description                                                                                                                                              | Type         | Default                                                                              | Required |
-|-----------------------------------|----------------------------------------------------------------------------------------------------------------------------------------------------------|--------------|--------------------------------------------------------------------------------------|:--------:|
-| helm_release_timeout              | Seconds to wait for the Langfuse Helm release to become ready                                                                                            | number       | 900                                                                                  |    no    |
-| postgres_version                  | PostgreSQL engine version to use                                                                                                                         | string       | "15.12"                                                                              |    no    |
-| additional_env                    | Additional environment variables to set on Langfuse pods                                                                                                 | list(object) | []                                                                                   |    no    |
-| skip_dns_setup                    | Skip the Route53 zone, ACM certificate, DNS validation records and the ALB alias record, for externally managed DNS. Requires certificate_arn.           | bool         | false                                                                                |    no    |
-| certificate_arn                   | ARN of an existing, externally managed ACM certificate. Required when skip_dns_setup is true.                                                            | string       | null                                                                                 |    no    |
-| name                              | Name prefix for resources                                                                                                                                | string       | "langfuse"                                                                           |    no    |
-| domain                            | Domain name used for resource naming                                                                                                                     | string       | n/a                                                                                  |   yes    |
-| vpc_cidr                          | CIDR block for VPC                                                                                                                                       | string       | "10.0.0.0/16"                                                                        |    no    |
-| vpc_id                            | ID of an existing VPC to reuse                                                                                                                           | string       | null                                                                                 |    no    |
-| private_subnet_ids                | List of private subnet IDs (required when using existing VPC)                                                                                            | list(string) | null                                                                                 |    no    |
-| public_subnet_ids                 | List of public subnet IDs (required when using existing VPC)                                                                                             | list(string) | null                                                                                 |    no    |
-| private_route_table_ids           | List of private route table IDs (optional when using existing VPC, for S3 VPC Gateway endpoint)                                                          | list(string) | null                                                                                 |    no    |
-| use_single_nat_gateway            | To use a single NAT Gateway (cheaper) or one per AZ (more resilient)                                                                                     | bool         | true                                                                                 |    no    |
-| kubernetes_version                | Kubernetes version for EKS cluster                                                                                                                       | string       | "1.32"                                                                               |    no    |
-| use_encryption_key                | Whether to use an Encryption key for LLM API credential and integration credential store                                                                 | bool         | true                                                                                 |    no    |
-| fargate_profile_namespaces        | List of namespaces to create Fargate profiles for                                                                                                        | list(string) | ["default", "langfuse", "kube-system", "cert-manager", "clickhouse-operator-system"] |    no    |
-| postgres_instance_count           | Number of PostgreSQL instances                                                                                                                           | number       | 2                                                                                    |    no    |
-| postgres_min_capacity             | Minimum ACU capacity for PostgreSQL Serverless v2                                                                                                        | number       | 0.5                                                                                  |    no    |
-| postgres_max_capacity             | Maximum ACU capacity for PostgreSQL Serverless v2                                                                                                        | number       | 2.0                                                                                  |    no    |
-| cache_node_type                   | ElastiCache node type                                                                                                                                    | string       | "cache.t4g.small"                                                                    |    no    |
-| cache_instance_count              | Number of ElastiCache instances                                                                                                                          | number       | 1                                                                                    |    no    |
-| langfuse_helm_chart_version       | Version of the Langfuse Helm chart to deploy; the AI features need >= 2.1.0                                                                                                             | string       | "2.1.3"                                                                              |    no    |
-| app_version                       | Langfuse application version (Docker image tag) to deploy. Defaults to the latest release at the time this module version was published.                 | string       | "4.14.0"                                                                             |    no    |
-| langfuse_cpu                      | CPU allocation for Langfuse containers                                                                                                                   | string       | "2"                                                                                  |    no    |
-| langfuse_memory                   | Memory allocation for Langfuse containers                                                                                                                | string       | "4Gi"                                                                                |    no    |
-| langfuse_web_replicas             | Number of replicas for Langfuse web container                                                                                                            | number       | 1                                                                                    |    no    |
-| langfuse_worker_replicas          | Number of replicas for Langfuse worker container                                                                                                         | number       | 1                                                                                    |    no    |
-| clickhouse_replicas               | Number of in-cluster ClickHouse replicas (single shard)                                                                                                  | number       | 3                                                                                    |    no    |
-| clickhouse_keeper_replicas        | Number of ClickHouse Keeper replicas (1, 3 or 5)                                                                                                         | number       | 3                                                                                    |    no    |
-| clickhouse_cpu                    | CPU allocation for ClickHouse containers                                                                                                                 | string       | "2"                                                                                  |    no    |
-| clickhouse_memory                 | Memory allocation for ClickHouse containers                                                                                                              | string       | "8Gi"                                                                                |    no    |
-| clickhouse_keeper_cpu             | CPU allocation for ClickHouse Keeper containers                                                                                                          | string       | "1"                                                                                  |    no    |
-| clickhouse_keeper_memory          | Memory allocation for ClickHouse Keeper containers                                                                                                       | string       | "2Gi"                                                                                |    no    |
-| clickhouse_storage_size           | Nominal persistent volume size per ClickHouse replica (EFS is elastic)                                                                                   | string       | "8Gi"                                                                                |    no    |
-| clickhouse_keeper_storage_size    | Nominal persistent volume size per Keeper replica (EFS is elastic)                                                                                       | string       | "8Gi"                                                                                |    no    |
-| clickhouse_operator_chart_version | Version of the ClickHouse operator Helm chart                                                                                                            | string       | "0.0.5"                                                                              |    no    |
-| cert_manager_chart_version        | Version of the cert-manager Helm chart                                                                                                                   | string       | "v1.20.2"                                                                            |    no    |
-| external_clickhouse               | Use an external ClickHouse (e.g. ClickHouse Cloud) instead of the in-cluster deployment. See [External ClickHouse](#external-clickhouse-bring-your-own). | object       | null                                                                                 |    no    |
-| external_clickhouse_password      | Password for the external ClickHouse user                                                                                                                | string       | ""                                                                                   |    no    |
-| enable_clickhouse_log_tables      | Whether to enable Clickhouse logging tables. Having them active produces a high base-load on the EFS filesystem.                                         | bool         | false                                                                                |    no    |
-| efs_throughput_mode               | EFS throughput mode for ClickHouse storage: elastic, provisioned or bursting                                                                             | string       | "elastic"                                                                            |    no    |
-| efs_provisioned_throughput_in_mibps | Provisioned EFS throughput in MiB/s. Required when efs_throughput_mode is provisioned                                                                    | number       | null                                                                                 |    no    |
-| alb_scheme                        | ALB scheme                                                                                                                                               | string       | "internet-facing"                                                                    |    no    |
-| ingress_inbound_cidrs             | Allowed CIDR blocks for ingress alb                                                                                                                      | list(string) | ["0.0.0.0/0"]                                                                        |    no    |
-| redis_at_rest_encryption          | At rest encryption enabled for the redis cluster                                                                                                         | bool         | false                                                                                |    no    |
-| redis_multi_az                    | Multi availability zone enabled for the redis cluster                                                                                                    | bool         | false                                                                                |    no    |
-| redis_snapshot_retention_limit    | Days of automatic Redis snapshots to keep (0 disables backups)                                                                                           | number       | 1                                                                                    |    no    |
-| redis_snapshot_window             | Daily UTC window for the automatic Redis snapshot                                                                                                        | string       | "03:00-04:00"                                                                        |    no    |
-| enable_code_based_eval_executors  | Create isolated Lambda executors and configure Langfuse code evals                                                                                        | bool         | false                                                                                |    no    |
-| code_based_eval_vpc_cidr          | Deprecated 1.1.1 name for isolated_execution_vpc_cidr, still honoured                                                                                       | string       | null                                                                                 |    no    |
-| isolated_execution_vpc_cidr       | CIDR for the shared isolated VPC that runs untrusted code (code evaluators and the agent sandbox)                                                         | string       | "10.1.0.0/24"                                                                        |    no    |
-| code_based_eval_executor_lambda_settings | Per-runtime Lambda memory, timeout, and reserved concurrency settings                                                                             | object       | See `variables.tf`                                                                   |    no    |
-| code_eval_execution_worker_concurrency | Code eval queue concurrency per worker                                                                                                               | number       | 5                                                                                    |    no    |
-| enable_ai_features                | Render the chart's AI feature values and grant Bedrock invoke. Requires a provider and model                                                                | bool         | false                                                                                |    no    |
-| ai_features_provider              | Provider for the instance-wide Langfuse AI model: bedrock, anthropic, or openai                                                                            | string       | null                                                                                 |    no    |
-| ai_features_model                 | Primary model for the AI features (LANGFUSE_AI_MODEL)                                                                                                     | string       | null                                                                                 |    no    |
-| ai_features_small_model           | Optional model for supplementary calls such as conversation titles                                                                                        | string       | null                                                                                 |    no    |
-| ai_features_api_key               | API key for the anthropic and openai providers, stored in the langfuse Kubernetes secret                                                                   | string       | null                                                                                 |    no    |
-| ai_features_base_url              | Base URL for the anthropic and openai providers; include /v1 for openai                                                                                    | string       | null                                                                                 |    no    |
-| ai_features_small_model           | Cheaper model for supplementary calls such as conversation titles                                                                                          | string       | null                                                                                 |    no    |
-| ai_features_bedrock_region        | Region for Bedrock invocations, defaults to the deployment region                                                                                         | string       | null                                                                                 |    no    |
-| ai_features_bedrock_model_arns    | Bedrock model ARNs the Langfuse role may invoke                                                                                                           | list(string) | ["*"]                                                                                |    no    |
-| enable_in_app_agent               | Set LANGFUSE_IN_APP_AGENT_ENABLED on web and worker. Requires enable_ai_features and Langfuse >= 4.25                                                     | bool         | false                                                                                |    no    |
-| enable_agent_sandbox_microvm      | Create the Lambda MicroVM sandbox for the in-app agent's code execution tools. Image build is out of band                                                  | bool         | false                                                                                |    no    |
-| agent_sandbox_image_name          | Lambda MicroVM image name used to construct the image ARN                                                                                                 | string       | "langfuse-in-app-agent-sandbox"                                                      |    no    |
-
-## Outputs
-
-| Name                   | Description                      |
-|------------------------|----------------------------------|
-| cluster_name           | EKS Cluster Name                 |
-| cluster_host           | EKS Cluster endpoint             |
-| cluster_ca_certificate | EKS Cluster CA certificate       |
-| cluster_token          | EKS Cluster authentication token |
-| private_subnet_ids     | Private subnet IDs from VPC      |
-| public_subnet_ids      | Public subnet IDs from VPC       |
-| bucket_name            | S3 bucket name for Langfuse      |
-| bucket_id              | S3 bucket ID for Langfuse        |
-| route53_nameservers    | Route53 zone nameservers (null when skip_dns_setup) |
-| load_balancer_dns_name | DNS name of the Langfuse ALB     |
-| load_balancer_zone_id  | Hosted zone ID of the ALB, for external Route53 alias records |
-
-## Support
-
-- [Langfuse Documentation](https://langfuse.com/docs)
-- [Langfuse GitHub](https://github.com/langfuse/langfuse)
-- [Join Langfuse Discord](https://langfuse.com/discord)
-
-## License
-
-MIT Licensed. See LICENSE for full details.
+This ensures that reference configurations for custom evaluators and upstream chart patterns remain accessible without interfering with the ECS Fargate deployment.
