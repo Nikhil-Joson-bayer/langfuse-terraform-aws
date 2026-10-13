@@ -27,7 +27,7 @@ resource "aws_kms_key" "langfuse" {
         Sid    = "Allow CloudWatch Logs to use KMS Key"
         Effect = "Allow"
         Principal = {
-          Service = "logs.${data.aws_region.current.name}.amazonaws.com"
+          Service = "logs.${data.aws_region.current.id}.amazonaws.com"
         }
         Action = [
           "kms:Encrypt*",
@@ -83,9 +83,9 @@ resource "random_password" "salt" {
 
 # ClickHouse password (if generated)
 resource "random_password" "clickhouse_password" {
-  count            = var.clickhouse_password == null ? 1 : 0
-  length           = 32
-  special          = false
+  count   = var.clickhouse_password == null ? 1 : 0
+  length  = 32
+  special = false
 }
 
 # -----------------------------------------------------------------------------
@@ -166,11 +166,11 @@ resource "aws_secretsmanager_secret_version" "clickhouse_credentials" {
   count     = local.clickhouse_enabled ? 1 : 0
   secret_id = aws_secretsmanager_secret.clickhouse_credentials[0].id
   secret_string = jsonencode({
-    user           = var.clickhouse_user
-    password       = var.clickhouse_password != null ? var.clickhouse_password : random_password.clickhouse_password[0].result
-    url            = local.clickhouse_http_url
-    migration_url  = local.clickhouse_migration_url
-    database       = var.clickhouse_db
+    user          = var.clickhouse_user
+    password      = var.clickhouse_password != null ? var.clickhouse_password : random_password.clickhouse_password[0].result
+    url           = local.clickhouse_http_url
+    migration_url = local.clickhouse_migration_url
+    database      = var.clickhouse_db
   })
 }
 

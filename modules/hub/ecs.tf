@@ -45,7 +45,7 @@ locals {
       { name = "NEXTAUTH_URL", value = local.effective_web_url },
       { name = "LANGFUSE_ENABLE_EXPERIMENTAL_FEATURES", value = "true" },
       { name = "LANGFUSE_S3_EVENT_UPLOAD_BUCKET", value = aws_s3_bucket.events.id },
-      { name = "LANGFUSE_S3_EVENT_UPLOAD_REGION", value = data.aws_region.current.name },
+      { name = "LANGFUSE_S3_EVENT_UPLOAD_REGION", value = data.aws_region.current.id },
       { name = "TELEMETRY_ENABLED", value = "false" }
     ],
     local.clickhouse_enabled ? [
@@ -109,11 +109,11 @@ locals {
 
   # Container definition for langfuse-web
   web_container_def = {
-    name         = "langfuse-web"
-    image        = "${var.langfuse_image}:${var.langfuse_version}"
-    essential    = true
-    cpu          = var.ecs_web_cpu
-    memory       = var.ecs_web_memory
+    name      = "langfuse-web"
+    image     = "${var.langfuse_image}:${var.langfuse_version}"
+    essential = true
+    cpu       = var.ecs_web_cpu
+    memory    = var.ecs_web_memory
     portMappings = [
       {
         containerPort = var.port
@@ -134,7 +134,7 @@ locals {
       logDriver = "awslogs"
       options = {
         "awslogs-group"         = aws_cloudwatch_log_group.ecs.name
-        "awslogs-region"        = data.aws_region.current.name
+        "awslogs-region"        = data.aws_region.current.id
         "awslogs-stream-prefix" = "web"
       }
     }
@@ -159,7 +159,7 @@ locals {
       logDriver = "awslogs"
       options = {
         "awslogs-group"         = aws_cloudwatch_log_group.ecs.name
-        "awslogs-region"        = data.aws_region.current.name
+        "awslogs-region"        = data.aws_region.current.id
         "awslogs-stream-prefix" = "worker"
       }
     }
@@ -219,7 +219,7 @@ locals {
         logDriver = "awslogs"
         options = {
           "awslogs-group"         = aws_cloudwatch_log_group.ecs.name
-          "awslogs-region"        = data.aws_region.current.name
+          "awslogs-region"        = data.aws_region.current.id
           "awslogs-stream-prefix" = "clickhouse"
         }
       }

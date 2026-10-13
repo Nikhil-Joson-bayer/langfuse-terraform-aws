@@ -139,8 +139,8 @@ resource "aws_secretsmanager_secret" "redis_credentials" {
 resource "aws_secretsmanager_secret_version" "redis_credentials" {
   secret_id = aws_secretsmanager_secret.redis_credentials.id
   secret_string = jsonencode({
-    host      = aws_elasticache_replication_group.redis.primary_endpoint_address
-    port      = local.redis_port
+    host       = aws_elasticache_replication_group.redis.primary_endpoint_address
+    port       = local.redis_port
     auth_token = random_password.redis_auth_token.result
     # rediss:// for in-transit TLS enabled connection
     redis_url = "rediss://:${random_password.redis_auth_token.result}@${aws_elasticache_replication_group.redis.primary_endpoint_address}:${local.redis_port}"
